@@ -1,0 +1,10 @@
+streamlit
+plotly
+open3d
+numpy
+pyyaml
+langgraph
+langchain
+langchain-openai
+langchain-community
+faiss-cpu
