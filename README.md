@@ -8,8 +8,6 @@ It combines:
 - lightweight retrieval over safety and planner guidance,
 - and a coordinator that produces a risk level, scene assessment, and recommended action.
 
-The result is not just a visualization tool. It is a compact decision-support workflow for robotics scenarios.
-
 ## Why This Project Exists
 
 A robot rarely makes decisions from one signal alone.
@@ -71,7 +69,7 @@ Key files:
 - `integrated_pointcloud_tool.py`: Point-cloud loading, segmentation, clustering, semantic labeling, and plotting data preparation.
 - `perception.py`: Thin wrapper around the point-cloud extraction pipeline.
 - `mcp_tools.py`: YAML parsing for robot state and nearby actors.
-- `rag.py`: Simple retrieval layer plus optional LangChain vector store support.
+- `rag.py`: Retrieval layer plus optional LangChain vector store support.
 - `sample_assets.py`: Registry and loader for bundled sample scenes.
 - `sample_data/`: Built-in point cloud and YAML pairs.
 - `demo_data.py`: In-repo safety and planner knowledge used by the retrieval layer.
@@ -211,21 +209,3 @@ Important limitations:
 - the rule-based coordinator is intentionally simple,
 - YAML parsing assumes a narrow metadata structure,
 - and perception quality depends heavily on the input point cloud and `open3d` processing assumptions.
-
-## Good Use Cases
-
-This repo is a good fit for:
-- robotics demos,
-- hackathon prototypes,
-- explainable autonomy experiments,
-- point-cloud UI experiments,
-- and teaching how multi-stage robot reasoning pipelines fit together.
-
-## Summary
-
-If you want a compact robotics demo that feels closer to a system than a chatbot, this project gives you:
-- real point-cloud ingestion,
-- interpretable scene summaries,
-- metadata-aware reasoning,
-- retrieval-grounded recommendations,
-- and a UI that makes the full pipeline visible.
