@@ -42,6 +42,60 @@ The Streamlit interface is organized around a practical robotics workflow:
 
 Two sample scenes are included in `sample_data/` so the project is usable out of the box.
 
+## Architecture
+
+```mermaid
+flowchart TD
+    subgraph INPUT["Input"]
+        PCD["📄 .pcd / .ply\nPoint Cloud"]
+        META["📋 .yaml\nMetadata"]
+    end
+
+    subgraph PERC["① Perception"]
+        direction LR
+        P1["Parse\n(Open3D)"] --> P2["Ground\nSegment"] --> P3["Cluster\nObstacles"] --> P4["Semantic\nLabel"]
+    end
+
+    subgraph RAG["② RAG"]
+        direction LR
+        R1["Knowledge\nBase"] --> R2["FAISS\nIndex"] --> R3["Retrieve\n(LangChain)"]
+    end
+
+    subgraph STATE["③ State Tools"]
+        direction LR
+        S1["Pose &\nSpeed"]
+        S2["Nearby\nActors"]
+    end
+
+    subgraph COORD["④ Coordinator"]
+        C1["Rule-based Logic\n(default)"]
+        C2["LLM Decision\n(OpenAI · optional)"]
+        C1 -.->|"fallback"| C2
+    end
+
+    subgraph OUT["Output"]
+        direction LR
+        O1["⚠️ Risk Level\nLow / Medium / High"]
+        O2["✅ Recommended\nAction"]
+        O3["📊 3D Scene\nVisualization"]
+        O4["📝 Evidence &\nAssessment"]
+    end
+
+    PCD --> PERC
+    META --> STATE
+    PERC --> COORD
+    RAG  --> COORD
+    STATE --> COORD
+    COORD --> OUT
+
+    style INPUT fill:#dbeafe,stroke:#3b82f6,color:#1e3a5f
+    style PERC  fill:#dcfce7,stroke:#22c55e,color:#14532d
+    style RAG   fill:#fff7ed,stroke:#f97316,color:#7c2d12
+    style STATE fill:#f5f3ff,stroke:#8b5cf6,color:#3b0764
+    style COORD fill:#fce7f3,stroke:#ec4899,color:#831843
+    style OUT   fill:#f0fdfa,stroke:#14b8a6,color:#134e4a
+```
+
 ## Pipeline Overview
 
 The application follows a simple multi-stage pipeline:
