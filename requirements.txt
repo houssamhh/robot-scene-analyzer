@@ -1,6 +1,6 @@
 streamlit
 plotly
-open3d
+open3d-cpu
 numpy
 pyyaml
 langgraph
