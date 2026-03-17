@@ -1,6 +1,7 @@
 streamlit
 plotly
-open3d-cpu
+trimesh
+scikit-learn
 numpy
 pyyaml
 langgraph

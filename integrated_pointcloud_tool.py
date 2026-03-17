@@ -6,35 +6,259 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
+import struct
+
 import numpy as np
-
-try:
-    import open3d as o3d
-    OPEN3D_AVAILABLE = True
-except Exception:
-    OPEN3D_AVAILABLE = False
+from sklearn.cluster import DBSCAN
 
 
-def _require_open3d() -> None:
-    if not OPEN3D_AVAILABLE:
-        raise RuntimeError("open3d is not installed. Install it to load and analyze point clouds.")
+# ---------------------------------------------------------------------------
+# Multi-format point cloud file reader (no open3d / pyntcloud dependency)
+# ---------------------------------------------------------------------------
+
+def _load_points_from_file(path: str, suffix: str) -> np.ndarray:
+    """Return an (N, 3) float64 array of XYZ points from a point cloud file."""
+    suffix = suffix.lower()
+
+    if suffix == ".ply":
+        return _read_ply(path)
+    if suffix == ".pcd":
+        return _read_pcd(path)
+    if suffix in (".las", ".laz"):
+        return _read_las(path)
+    if suffix in (".xyz", ".txt", ".csv"):
+        return _read_xyz(path)
+
+    # Generic fallback: try trimesh, then plain text
+    try:
+        import trimesh
+        loaded = trimesh.load(path, process=False)
+        if hasattr(loaded, "vertices"):
+            return np.asarray(loaded.vertices, dtype=np.float64)
+    except Exception:
+        pass
+    return _read_xyz(path)
 
 
-def load_point_cloud_from_bytes(file_bytes: bytes, suffix: str):
-    _require_open3d()
+def _read_ply(path: str) -> np.ndarray:
+    try:
+        import trimesh
+        loaded = trimesh.load(path, process=False)
+        if hasattr(loaded, "vertices"):
+            return np.asarray(loaded.vertices, dtype=np.float64)
+    except Exception:
+        pass
+    # Fallback: minimal ASCII PLY reader
+    with open(path, "rb") as f:
+        raw = f.read()
+    # find end_header
+    header_end = raw.find(b"end_header\n")
+    if header_end == -1:
+        raise ValueError("Could not parse PLY header.")
+    header = raw[:header_end].decode("ascii", errors="replace")
+    data_start = header_end + len("end_header\n")
+    is_binary = "binary" in header
+    if is_binary:
+        raise ValueError("Binary PLY not supported without trimesh; install trimesh.")
+    lines = raw[data_start:].decode("ascii", errors="replace").splitlines()
+    rows = []
+    for line in lines:
+        parts = line.split()
+        if len(parts) >= 3:
+            try:
+                rows.append([float(parts[0]), float(parts[1]), float(parts[2])])
+            except ValueError:
+                pass
+    return np.array(rows, dtype=np.float64)
+
+
+def _read_pcd(path: str) -> np.ndarray:
+    """Read PCD v0.7 files (ASCII and binary)."""
+    with open(path, "rb") as f:
+        raw = f.read()
+
+    header_end = raw.find(b"\nDATA ")
+    if header_end == -1:
+        raise ValueError("Could not find DATA section in PCD file.")
+    header_bytes = raw[: header_end + 1]
+    header = header_bytes.decode("ascii", errors="replace")
+
+    data_type = "ascii"
+    fields: List[str] = []
+    sizes: List[int] = []
+    types: List[str] = []
+    count = 1
+    num_points = 0
+
+    for line in header.splitlines():
+        parts = line.strip().split()
+        if not parts:
+            continue
+        key = parts[0].upper()
+        if key == "FIELDS":
+            fields = parts[1:]
+        elif key == "SIZE":
+            sizes = [int(s) for s in parts[1:]]
+        elif key == "TYPE":
+            types = parts[1:]
+        elif key == "POINTS":
+            num_points = int(parts[1])
+        elif key == "DATA":
+            data_type = parts[1].lower()
+
+    # locate x, y, z indices
+    try:
+        xi, yi, zi = fields.index("x"), fields.index("y"), fields.index("z")
+    except ValueError:
+        raise ValueError("PCD file does not contain x, y, z fields.")
+
+    data_offset = header_end + len(b"\nDATA ") + len(data_type.encode()) + 1  # skip newline
+
+    if data_type == "ascii":
+        lines = raw[data_offset:].decode("ascii", errors="replace").splitlines()
+        rows = []
+        for line in lines:
+            parts = line.split()
+            if len(parts) > max(xi, yi, zi):
+                try:
+                    rows.append([float(parts[xi]), float(parts[yi]), float(parts[zi])])
+                except ValueError:
+                    pass
+        return np.array(rows, dtype=np.float64)
+
+    elif data_type == "binary":
+        type_map = {"F": "f", "I": "i", "U": "u"}
+        fmt_chars = []
+        for t, s in zip(types, sizes):
+            base = type_map.get(t.upper(), "f")
+            fmt_chars.append(f"{base}{s}")
+        point_size = sum(sizes)
+        data = raw[data_offset: data_offset + num_points * point_size]
+        rows = []
+        for i in range(num_points):
+            chunk = data[i * point_size: (i + 1) * point_size]
+            offset = 0
+            vals = []
+            for t, s in zip(types, sizes):
+                base = type_map.get(t.upper(), "f")
+                val = struct.unpack_from(f"<{base}{s // max(s, 1)}", chunk, offset)[0]
+                vals.append(float(val))
+                offset += s
+            rows.append([vals[xi], vals[yi], vals[zi]])
+        return np.array(rows, dtype=np.float64)
+
+    raise ValueError(f"Unsupported PCD data type: {data_type}")
+
+
+def _read_las(path: str) -> np.ndarray:
+    try:
+        import laspy
+        las = laspy.read(path)
+        return np.stack([
+            np.asarray(las.x, dtype=np.float64),
+            np.asarray(las.y, dtype=np.float64),
+            np.asarray(las.z, dtype=np.float64),
+        ], axis=1)
+    except ImportError as exc:
+        raise RuntimeError("laspy is required to load LAS/LAZ files. Install it with: pip install laspy") from exc
+
+
+def _read_xyz(path: str) -> np.ndarray:
+    rows = []
+    with open(path, "r", errors="replace") as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) >= 3:
+                try:
+                    rows.append([float(parts[0]), float(parts[1]), float(parts[2])])
+                except ValueError:
+                    pass
+    if not rows:
+        raise ValueError("Could not parse any XYZ points from the file.")
+    return np.array(rows, dtype=np.float64)
+
+
+# ---------------------------------------------------------------------------
+# Minimal PointCloud wrapper (replaces open3d PointCloud)
+# ---------------------------------------------------------------------------
+
+class PointCloud:
+    """Lightweight numpy-backed point cloud, drop-in for the open3d subset used here."""
+
+    def __init__(self, points: np.ndarray):
+        self._points = np.asarray(points, dtype=np.float64)
+
+    @property
+    def points(self) -> np.ndarray:
+        return self._points
+
+    @points.setter
+    def points(self, value: np.ndarray) -> None:
+        self._points = np.asarray(value, dtype=np.float64)
+
+    def __len__(self) -> int:
+        return len(self._points)
+
+    def select_by_index(self, indices: np.ndarray, invert: bool = False) -> "PointCloud":
+        indices = np.asarray(indices, dtype=int)
+        if invert:
+            mask = np.ones(len(self._points), dtype=bool)
+            mask[indices] = False
+            return PointCloud(self._points[mask])
+        return PointCloud(self._points[indices])
+
+
+# ---------------------------------------------------------------------------
+# RANSAC plane segmentation (replaces open3d segment_plane)
+# ---------------------------------------------------------------------------
+
+def _ransac_fit_plane(
+    points: np.ndarray,
+    distance_threshold: float,
+    ransac_n: int,
+    num_iterations: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Return indices of inlier points for the best-fit plane found by RANSAC."""
+    n = len(points)
+    best_inliers: np.ndarray = np.array([], dtype=int)
+
+    for _ in range(num_iterations):
+        sample_idx = rng.choice(n, ransac_n, replace=False)
+        sample = points[sample_idx]
+        centroid = sample.mean(axis=0)
+        centered = sample - centroid
+        _, _, vt = np.linalg.svd(centered, full_matrices=False)
+        normal = vt[-1]
+        norm = np.linalg.norm(normal)
+        if norm < 1e-10:
+            continue
+        normal /= norm
+        d = -np.dot(normal, centroid)
+        distances = np.abs(points @ normal + d)
+        inliers = np.where(distances <= distance_threshold)[0]
+        if len(inliers) > len(best_inliers):
+            best_inliers = inliers
+
+    return best_inliers
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def load_point_cloud_from_bytes(file_bytes: bytes, suffix: str) -> PointCloud:
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp.write(file_bytes)
         tmp_path = tmp.name
     try:
-        pcd = o3d.io.read_point_cloud(tmp_path)
-        points = np.asarray(pcd.points)
+        points = _load_points_from_file(tmp_path, suffix)
         if len(points) == 0:
             raise ValueError("The uploaded point cloud is empty.")
 
         # Preserve the orientation used in the user's tool.
         points[:, 1] = -points[:, 1]
-        pcd.points = o3d.utility.Vector3dVector(points)
-        return pcd
+        return PointCloud(points)
     finally:
         try:
             os.remove(tmp_path)
@@ -42,41 +266,46 @@ def load_point_cloud_from_bytes(file_bytes: bytes, suffix: str):
             pass
 
 
-def segment_ground(pcd, distance_threshold: float = 0.2, ransac_n: int = 3, num_iterations: int = 200):
-    _require_open3d()
+def segment_ground(
+    pcd: PointCloud,
+    distance_threshold: float = 0.2,
+    ransac_n: int = 3,
+    num_iterations: int = 200,
+) -> Tuple[PointCloud, PointCloud]:
     if len(pcd.points) < max(ransac_n + 1, 4):
         raise ValueError(f"Not enough points to segment ground: found {len(pcd.points)} points.")
 
-    try:
-        _, inliers = pcd.segment_plane(
-            distance_threshold=distance_threshold,
-            ransac_n=ransac_n,
-            num_iterations=num_iterations,
-        )
-    except RuntimeError as exc:
-        if "ransac_n" in str(exc):
-            raise ValueError("Not enough valid points for RANSAC plane segmentation.") from exc
-        raise
+    rng = np.random.default_rng(0)
+    inliers = _ransac_fit_plane(pcd.points, distance_threshold, ransac_n, num_iterations, rng)
+    if len(inliers) == 0:
+        raise ValueError("Not enough valid points for RANSAC plane segmentation.")
 
     ground = pcd.select_by_index(inliers)
     objects = pcd.select_by_index(inliers, invert=True)
     return ground, objects
 
 
-def cluster_obstacles(objects, eps: float = 0.5, min_points: int = 10, ego_distance_threshold: float = 2.1):
-    _require_open3d()
+def cluster_obstacles(
+    objects: PointCloud,
+    eps: float = 0.5,
+    min_points: int = 10,
+    ego_distance_threshold: float = 2.1,
+) -> Tuple[List[PointCloud], np.ndarray]:
     if len(objects.points) == 0:
         return [], np.array([], dtype=int)
 
-    labels = np.array(objects.cluster_dbscan(eps=eps, min_points=min_points))
-    clusters = []
-    kept_cluster_ids = []
+    db = DBSCAN(eps=eps, min_samples=min_points).fit(objects.points)
+    labels = db.labels_.astype(int)
+
+    clusters: List[PointCloud] = []
+    kept_cluster_ids: List[int] = []
 
     for i in np.unique(labels):
         if i == -1:
             continue
-        cluster = objects.select_by_index(np.where(labels == i)[0])
-        points = np.asarray(cluster.points)
+        idx = np.where(labels == i)[0]
+        cluster = objects.select_by_index(idx)
+        points = cluster.points
         if len(points) == 0:
             continue
         centroid = points.mean(axis=0)
@@ -90,10 +319,10 @@ def cluster_obstacles(objects, eps: float = 0.5, min_points: int = 10, ego_dista
     return clusters, remapped_labels
 
 
-def describe_obstacles(clusters) -> List[Dict[str, Any]]:
+def describe_obstacles(clusters: List[PointCloud]) -> List[Dict[str, Any]]:
     obstacle_info: List[Dict[str, Any]] = []
     for i, cluster in enumerate(clusters):
-        points = np.asarray(cluster.points)
+        points = cluster.points
         centroid = points.mean(axis=0)
         pmin = points.min(axis=0)
         pmax = points.max(axis=0)
@@ -337,9 +566,9 @@ def _downsample(points: np.ndarray, colors: np.ndarray, max_points: int = 20000)
     return points[idx], colors[idx]
 
 
-def build_colored_plot_data(ground, objects, labels: np.ndarray) -> Dict[str, Any]:
-    ground_points = np.asarray(ground.points)
-    object_points = np.asarray(objects.points)
+def build_colored_plot_data(ground: PointCloud, objects: PointCloud, labels: np.ndarray) -> Dict[str, Any]:
+    ground_points = ground.points
+    object_points = objects.points
 
     ground_colors = np.tile(np.array([[0, 0, 255]], dtype=np.uint8), (len(ground_points), 1))
 
@@ -377,7 +606,6 @@ def centroid_plot_data(obstacle_info: List[Dict[str, Any]]) -> Dict[str, Any]:
         xs.append(float(c[0]))
         ys.append(float(c[1]))
         zs.append(float(c[2]))
-        # texts.append(f"{obs['id']} | {semantic['region']} | {semantic['distance_band']}")
         texts.append(f"{obs['id']}")
         hover_texts.append(
             f"Obstacle {obs['id']}<br>Region: {semantic['region']}<br>Distance: {semantic['distance_m']} m"
@@ -399,12 +627,12 @@ def extract_scene_from_bytes(file_bytes: bytes, filename: str) -> Dict[str, Any]
     semantic_text = obstacles_to_semantic_text(semantic_obstacles)
     scene_summary = summarize_scene_semantically(semantic_obstacles)
 
-    object_points = np.asarray(objects.points) if len(objects.points) else np.empty((0, 3))
+    object_points = objects.points if len(objects.points) else np.empty((0, 3))
     scene = obstacle_info_to_scene(semantic_obstacles, object_points)
     plot_data = build_colored_plot_data(ground, objects, labels)
     centroid_data = centroid_plot_data(semantic_obstacles)
 
-    points = np.asarray(pcd.points)
+    points = pcd.points
     combined_scene_text = f"{scene_summary}\n\n{semantic_text}" if semantic_text else scene_summary
     return {
         "scene": scene,
